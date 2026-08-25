@@ -58,17 +58,55 @@ export class Snapshot extends Base implements ISnapshot {
 
   async save(key, value) {
     const filepath = this.getSnapshotFile(key);
+    // 对齐 Java SDK LocalConfigInfoProcessor.saveSnapshot：空内容视为删除，
+    // 避免服务端配置缺失或为空时残留过期快照，导致故障回退读到脏数据
+    if (!value) {
+      await this.delete(key);
+      return;
+    }
     const dir = path.dirname(filepath);
-    value = value || '';
     try {
       await mkdirp(dir);
-      await fs.writeFile(filepath, value);
+      // 先写临时文件再 rename，避免多进程读到写一半的内容
+      const tmpPath = `${filepath}.tmp.${process.pid}`;
+      await fs.writeFile(tmpPath, value);
+      await fs.rename(tmpPath, filepath);
     } catch (err) {
       err.name = 'SnapshotWriteError';
       err.key = key;
       err.value = value;
       this.emit('error', err);
     }
+  }
+
+  async getFailover(key): Promise<string | null> {
+    const filepath = this.getFailoverFile(key);
+    try {
+      // 仅读取普通文件（对齐 Java SDK: !localPath.isFile() 时返回 null）
+      const stat = await fs.stat(filepath);
+      if (stat.isFile()) {
+        return await fs.readFile(filepath, 'utf8');
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        err.name = 'FailoverReadError';
+        this.emit('error', err);
+      }
+    }
+    return null;
+  }
+
+  async getFailoverMtime(key): Promise<number | null> {
+    const filepath = this.getFailoverFile(key);
+    try {
+      const stat = await fs.stat(filepath);
+      if (stat.isFile()) {
+        return stat.mtimeMs;
+      }
+    } catch (err) {
+      // 文件不存在属于正常情况，不上报错误
+    }
+    return null;
   }
 
   async delete(key) {
@@ -89,5 +127,9 @@ export class Snapshot extends Base implements ISnapshot {
 
   private getSnapshotFile(key) {
     return path.join(this.cacheDir, 'snapshot', key);
+  }
+
+  private getFailoverFile(key) {
+    return path.join(this.cacheDir, 'failover', key);
   }
 }

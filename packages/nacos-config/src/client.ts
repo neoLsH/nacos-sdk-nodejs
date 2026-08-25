@@ -32,11 +32,24 @@ import { checkParameters } from './utils';
 import { HttpAgent } from './http_agent';
 import { Configuration } from './configuration';
 import { GrpcConfigProxy } from './grpc_config_proxy';
+import { readConfigWithFailover } from './disaster_recovery';
 import { GrpcConnection, GrpcTransportClient } from 'nacos-common';
 import * as assert from 'assert';
+import * as path from 'path';
 
 const Base = require('sdk-base');
 
+/** gRPC 模式下本地容灾文件的轮询检查间隔（毫秒）。 */
+const FAILOVER_CHECK_INTERVAL = 10000;
+
+/** gRPC 订阅项的本地容灾状态（对齐 Java SDK CacheData 的 isUseLocalConfigInfo / localConfigLastModified）。 */
+interface GrpcFailoverState {
+  dataId: string;
+  group: string;
+  useFailover: boolean;
+  failoverVersion: number | null;
+  content: string | null;
+}
 
 export class DataClient extends Base implements BaseClient {
 
@@ -50,6 +63,8 @@ export class DataClient extends Base implements BaseClient {
   private _grpcTransportClient: GrpcTransportClient | null;
   private _grpcConfigProxy: GrpcConfigProxy | null;
   private _grpcSubscribers: Map<string, Function[]> | null;
+  private _grpcFailoverState: Map<string, GrpcFailoverState> | null;
+  private _failoverWatcher: any;
 
   constructor(options: ClientOptions) {
     if(!options.endpoint && !options.serverAddr) {
@@ -64,6 +79,8 @@ export class DataClient extends Base implements BaseClient {
     this._grpcTransportClient = null;
     this._grpcConfigProxy = null;
     this._grpcSubscribers = null;
+    this._grpcFailoverState = null;
+    this._failoverWatcher = null;
 
     this.snapshot = this.getSnapshot();
     (<any>this.snapshot).on('error', err => this.throwError(err));
@@ -192,25 +209,51 @@ export class DataClient extends Base implements BaseClient {
         this._grpcConfigProxy.on('configChanged', async (evt) => {
           const evtKey = `${evt.dataId}@@${evt.group}`;
           const listeners = this._grpcSubscribers!.get(evtKey);
-          if (listeners && listeners.length > 0) {
-            try {
-              const content = await this._grpcConfigProxy!.getConfig(evt.dataId, evt.group);
-              for (const fn of listeners) { fn(content); }
-            } catch (err) {
-              this.throwError(err);
+          if (!listeners || listeners.length === 0) {
+            return;
+          }
+          // 处于本地容灾模式的 key 忽略服务端变更推送（对齐 Java：local config wins）
+          const state = this._grpcFailoverState!.get(evtKey);
+          if (state && state.useFailover) {
+            return;
+          }
+          try {
+            // 带容灾读取：成功落快照，服务端异常回退快照
+            const content = await this._getConfigWithCache(evt.dataId, evt.group);
+            if (state) {
+              state.content = content;
             }
+            for (const fn of listeners) { fn(content); }
+          } catch (err) {
+            this.throwError(err);
           }
         });
       }
       const listeners = this._grpcSubscribers.get(key) || [];
       listeners.push(listener);
       this._grpcSubscribers.set(key, listeners);
-      // Get current content and call listener immediately
-      this._grpcConfigProxy.getConfig(dataId, group).then(content => {
+      // 登记本地容灾状态并启动 failover 文件热切换轮询（对齐 Java checkLocalConfig）
+      if (!this._grpcFailoverState) {
+        this._grpcFailoverState = new Map();
+      }
+      if (!this._grpcFailoverState.has(key)) {
+        this._grpcFailoverState.set(key, { dataId, group, useFailover: false, failoverVersion: null, content: null });
+      }
+      this._startFailoverWatcher();
+      // 带容灾拉取当前内容（failover > 服务端 > 快照）：回调监听器并注册 gRPC 监听
+      this._getConfigWithCache(dataId, group).then(async content => {
         if (content) listener(content);
-      }).catch(() => {});
-      // Register gRPC listen (need MD5 of current content)
-      this._grpcConfigProxy.getConfig(dataId, group).then(content => {
+        const state = this._grpcFailoverState!.get(key);
+        if (state) {
+          state.content = content;
+          // 存在容灾文件则立即进入 failover 模式，否则等下一轮 watcher 探测
+          const mtime = await this.snapshot.getFailoverMtime(this._getSnapshotKey(dataId, group));
+          if (mtime !== null) {
+            state.useFailover = true;
+            state.failoverVersion = mtime;
+          }
+        }
+        // md5 基于服务端原文（可能是密文）计算，与服务端监听探针保持一致，避免误判变更
         const crypto = require('crypto');
         const md5 = content ? crypto.createHash('md5').update(content).digest('hex') : '';
         this._grpcConfigProxy!.addListener(dataId, group, md5).catch(() => {});
@@ -236,11 +279,17 @@ export class DataClient extends Base implements BaseClient {
           if (idx >= 0) listeners.splice(idx, 1);
           if (listeners.length === 0) {
             this._grpcSubscribers.delete(key);
+            if (this._grpcFailoverState) { this._grpcFailoverState.delete(key); }
             this._grpcConfigProxy.removeListener(dataId, group).catch(() => {});
           }
         } else {
           this._grpcSubscribers.delete(key);
+          if (this._grpcFailoverState) { this._grpcFailoverState.delete(key); }
           this._grpcConfigProxy.removeListener(dataId, group).catch(() => {});
+        }
+        // 没有订阅项后停止 failover 文件轮询
+        if (this._grpcSubscribers.size === 0) {
+          this._stopFailoverWatcher();
         }
       }
       return this;
@@ -262,7 +311,8 @@ export class DataClient extends Base implements BaseClient {
   async getConfig(dataId, group, options?) {
     checkParameters(dataId, group);
     if (this._grpcConfigProxy) {
-      return await this._grpcConfigProxy.getConfig(dataId, group, this.configuration.get(ClientOptionKeys.NAMESPACE));
+      // 带本地容灾读取：failover > 服务端 > 快照（对齐 Java SDK 读优先级）
+      return await this._getConfigWithCache(dataId, group, this.configuration.get(ClientOptionKeys.NAMESPACE));
     }
     const client = this.getClient(options);
     return await client.getConfig(dataId, group);
@@ -313,7 +363,10 @@ export class DataClient extends Base implements BaseClient {
   async remove(dataId, group, options?) {
     checkParameters(dataId, group);
     if (this._grpcConfigProxy) {
-      return await this._grpcConfigProxy.remove(dataId, group, this.configuration.get(ClientOptionKeys.NAMESPACE));
+      const removed = await this._grpcConfigProxy.remove(dataId, group, this.configuration.get(ClientOptionKeys.NAMESPACE));
+      // 同步清理本地快照，避免服务端已删除的配置残留在缓存里（与 HTTP 模式一致）
+      await this.snapshot.delete(this._getSnapshotKey(dataId, group));
+      return removed;
     }
     const client = this.getClient(options);
     return await client.remove(dataId, group);
@@ -399,6 +452,7 @@ export class DataClient extends Base implements BaseClient {
   }
 
   close() {
+    this._stopFailoverWatcher();
     if (this._grpcConfigProxy) {
       this._grpcConfigProxy.close();
     }
@@ -458,6 +512,111 @@ export class DataClient extends Base implements BaseClient {
 
   protected getSnapshot(): ISnapshot {
     return new Snapshot(this.options);
+  }
+
+  /**
+   * 与 ClientWorker.getSnapshotKeyEncoded 一致的快照 key 编码，
+   * 保证 HTTP / gRPC 两种传输共享同一份本地缓存与容灾文件。
+   */
+  private _getSnapshotKey(dataId: string, group: string): string {
+    const tenant = this.configuration.get(ClientOptionKeys.NAMESPACE) || 'default_tenant';
+    const unit = this.configuration.get(ClientOptionKeys.UNIT) || CURRENT_UNIT;
+    return path.join(
+      'config',
+      encodeURIComponent(unit),
+      encodeURIComponent(tenant),
+      encodeURIComponent(group),
+      encodeURIComponent(dataId)
+    );
+  }
+
+  /**
+   * gRPC 模式带本地容灾的读取（对齐 Java SDK 读优先级 failover > server > snapshot）：
+   * - 用户手工维护的 failover 文件存在时优先返回；
+   * - 否则查询服务端，成功后落快照（空/缺失内容由 Snapshot.save 统一按删除处理，等价 Java saveSnapshot(null)）；
+   * - 服务端异常时回退本地快照，快照也没有才抛错。
+   */
+  private async _getConfigWithCache(dataId: string, group: string, tenant?: string): Promise<string> {
+    const key = this._getSnapshotKey(dataId, group);
+    const content = await readConfigWithFailover({
+      snapshotKey: key,
+      snapshot: this.snapshot,
+      fetchFromServer: () => this._grpcConfigProxy!.getConfig(dataId, group, tenant),
+      readSnapshotFallback: () => this.snapshot.get(key),
+      onServerError: err => this.throwError(err),
+    });
+    return content === null ? '' : content;
+  }
+
+  /**
+   * gRPC 模式下的本地容灾文件热切换（对齐 Java SDK ClientWorker.checkLocalConfig）：
+   * - 文件新建/变更 → 切到容灾内容并通知监听器；
+   * - 文件删除 → 回退服务端内容并通知监听器。
+   * gRPC 无长轮询循环，由 _failoverWatcher 定时驱动。
+   */
+  private async _checkGrpcLocalFailover(): Promise<void> {
+    if (!this._grpcSubscribers || !this._grpcFailoverState) {
+      return;
+    }
+    for (const [key, listeners] of this._grpcSubscribers.entries()) {
+      const state = this._grpcFailoverState.get(key);
+      if (!state || listeners.length === 0) {
+        continue;
+      }
+      const snapshotKey = this._getSnapshotKey(state.dataId, state.group);
+      const mtime = await this.snapshot.getFailoverMtime(snapshotKey);
+
+      if (mtime === null) {
+        // 容灾文件被删除：切回服务端内容
+        if (state.useFailover) {
+          state.useFailover = false;
+          state.failoverVersion = null;
+          try {
+            const content = await this._getConfigWithCache(state.dataId, state.group);
+            if (content !== state.content) {
+              state.content = content;
+              for (const fn of listeners) { fn(content); }
+            }
+          } catch (err) {
+            this.throwError(err);
+          }
+        }
+        continue;
+      }
+
+      if (!state.useFailover || state.failoverVersion !== mtime) {
+        const content = await this.snapshot.getFailover(snapshotKey);
+        if (content === null) {
+          continue;
+        }
+        state.useFailover = true;
+        state.failoverVersion = mtime;
+        if (content !== state.content) {
+          state.content = content;
+          for (const fn of listeners) { fn(content); }
+        }
+      }
+    }
+  }
+
+  private _startFailoverWatcher(): void {
+    if (this._failoverWatcher || this._transport !== 'grpc') {
+      return;
+    }
+    this._failoverWatcher = setInterval(() => {
+      this._checkGrpcLocalFailover().catch(err => this.throwError(err));
+    }, FAILOVER_CHECK_INTERVAL);
+    // 不阻止进程正常退出
+    if (this._failoverWatcher.unref) {
+      this._failoverWatcher.unref();
+    }
+  }
+
+  private _stopFailoverWatcher(): void {
+    if (this._failoverWatcher) {
+      clearInterval(this._failoverWatcher);
+      this._failoverWatcher = null;
+    }
   }
 
 }
