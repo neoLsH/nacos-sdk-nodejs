@@ -255,7 +255,7 @@ describe('test/local_cache.test.ts', () => {
       let serverCalled = false;
       mm((client as any)._grpcConfigProxy, 'getConfig', async () => {
         serverCalled = true;
-        return 'server-config';
+        return { content: 'server-config' };
       });
       const snapshotKey = (client as any)._getSnapshotKey('fo-data-id', 'fo-group');
       const failoverFile = (client as any).snapshot.getFailoverFile(snapshotKey);
@@ -269,7 +269,7 @@ describe('test/local_cache.test.ts', () => {
 
     it('should save snapshot when server responds', async () => {
       const client = createGrpcClient();
-      mm((client as any)._grpcConfigProxy, 'getConfig', async () => 'server-config');
+      mm((client as any)._grpcConfigProxy, 'getConfig', async () => ({ content: 'server-config' }));
       const snapshotKey = (client as any)._getSnapshotKey('snap-data-id', 'fo-group');
 
       const content = await client.getConfig('snap-data-id', 'fo-group');
@@ -310,7 +310,7 @@ describe('test/local_cache.test.ts', () => {
       await (client as any).snapshot.save(snapshotKey, 'stale-content');
       assert(await (client as any).snapshot.get(snapshotKey) === 'stale-content');
       // gRPC getConfig 对缺失配置返回空串，空内容应按删除处理（对齐 Java saveSnapshot(null)）
-      mm((client as any)._grpcConfigProxy, 'getConfig', async () => '');
+      mm((client as any)._grpcConfigProxy, 'getConfig', async () => ({ content: '' }));
 
       const content = await client.getConfig('blank-data-id', 'fo-group');
       assert(content === '');
@@ -373,7 +373,7 @@ describe('test/local_cache.test.ts', () => {
       await (client as any)._checkGrpcLocalFailover();
       assert((client as any)._grpcFailoverState.get(key).useFailover === true);
 
-      mm((client as any)._grpcConfigProxy, 'getConfig', async () => 'server-config');
+      mm((client as any)._grpcConfigProxy, 'getConfig', async () => ({ content: 'server-config' }));
       await rimraf(failoverFile);
       await (client as any)._checkGrpcLocalFailover();
       const state = (client as any)._grpcFailoverState.get(key);
@@ -386,7 +386,7 @@ describe('test/local_cache.test.ts', () => {
     it('should deliver server push when not in failover mode', async () => {
       const client = createGrpcClient();
       let serverContent = 'server-config';
-      mm((client as any)._grpcConfigProxy, 'getConfig', async () => serverContent);
+      mm((client as any)._grpcConfigProxy, 'getConfig', async () => ({ content: serverContent }));
       mm((client as any)._grpcConfigProxy, 'addListener', async () => {});
       const received: string[] = [];
       client.subscribe({ dataId: 'push-ok-data-id', group: 'fo-group' }, (content: string) => received.push(content));
@@ -401,7 +401,7 @@ describe('test/local_cache.test.ts', () => {
     it('should ignore server push while in failover mode', async () => {
       const client = createGrpcClient();
       let serverContent = 'server-config';
-      mm((client as any)._grpcConfigProxy, 'getConfig', async () => serverContent);
+      mm((client as any)._grpcConfigProxy, 'getConfig', async () => ({ content: serverContent }));
       mm((client as any)._grpcConfigProxy, 'addListener', async () => {});
       const received: string[] = [];
       client.subscribe({ dataId: 'push-data-id', group: 'fo-group' }, (content: string) => received.push(content));

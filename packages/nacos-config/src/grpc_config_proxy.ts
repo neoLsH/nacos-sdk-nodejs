@@ -28,6 +28,12 @@ interface ListenContext {
   md5: string;
 }
 
+/** Raw config content plus the KMS-encrypted data key carried by ConfigQueryResponse. */
+export interface ConfigQueryResult {
+  content: string;
+  encryptedDataKey?: string;
+}
+
 /**
  * GrpcConfigProxy provides config operations (get/publish/remove/listen) over gRPC.
  * Emits 'configChanged' event when the server pushes a config change notification.
@@ -104,8 +110,9 @@ export class GrpcConfigProxy extends Base {
 
   /**
    * Get config value via gRPC ConfigQueryRequest.
+   * Returns the raw (still encrypted) content plus encryptedDataKey; decryption happens at the caller boundary.
    */
-  async getConfig(dataId: string, group: string, tenant?: string): Promise<string> {
+  async getConfig(dataId: string, group: string, tenant?: string): Promise<ConfigQueryResult> {
     const resolvedTenant = tenant != null ? tenant : this._namespace;
     this._logger.info('[GrpcConfigProxy] getConfig dataId=%s group=%s tenant=%s', dataId, group, resolvedTenant);
     const request = {
@@ -114,13 +121,17 @@ export class GrpcConfigProxy extends Base {
       tenant: resolvedTenant,
     };
     const response = await this._transportClient.request(request, 'ConfigQueryRequest');
-    return response.content || '';
+    return {
+      content: response.content || '',
+      encryptedDataKey: response.encryptedDataKey || undefined,
+    };
   }
 
   /**
    * Publish config via gRPC ConfigPublishRequest.
+   * encryptedDataKey (KMS-encrypted data key) travels as a ConfigPublishRequest additionMap entry.
    */
-  async publishSingle(dataId: string, group: string, tenant: string | undefined, content: string, type?: string): Promise<boolean> {
+  async publishSingle(dataId: string, group: string, tenant: string | undefined, content: string, type?: string, encryptedDataKey?: string): Promise<boolean> {
     const resolvedTenant = tenant != null ? tenant : this._namespace;
     this._logger.info('[GrpcConfigProxy] publishSingle dataId=%s group=%s tenant=%s', dataId, group, resolvedTenant);
     const request: any = {
@@ -131,6 +142,9 @@ export class GrpcConfigProxy extends Base {
     };
     if (type) {
       request.type = type;
+    }
+    if (encryptedDataKey) {
+      request.additionMap = { encryptedDataKey };
     }
     const response = await this._transportClient.request(request, 'ConfigPublishRequest');
     return response.resultCode === 200;

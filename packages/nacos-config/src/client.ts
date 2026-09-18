@@ -31,7 +31,8 @@ import { CURRENT_UNIT, DEFAULT_OPTIONS } from './const';
 import { checkParameters } from './utils';
 import { HttpAgent } from './http_agent';
 import { Configuration } from './configuration';
-import { GrpcConfigProxy } from './grpc_config_proxy';
+import { GrpcConfigProxy, ConfigQueryResult } from './grpc_config_proxy';
+import { ConfigCipher, createConfigCipher } from './cipher';
 import { readConfigWithFailover } from './disaster_recovery';
 import { GrpcConnection, GrpcTransportClient } from 'nacos-common';
 import * as assert from 'assert';
@@ -55,6 +56,7 @@ export class DataClient extends Base implements BaseClient {
 
   private clients: Map<string, IClientWorker>;
   private configuration: IConfiguration;
+  private cipher: ConfigCipher;
   protected snapshot: ISnapshot;
   protected serverMgr: IServerListManager | null;
   protected httpAgent;
@@ -89,6 +91,8 @@ export class DataClient extends Base implements BaseClient {
       // gRPC mode: skip ServerListManager and HttpAgent; set up gRPC stack
       this.serverMgr = null;
       this.httpAgent = null;
+      // gRPC 模式下 KMS 信封加解密由 DataClient 直接负责（HTTP 模式在 ClientWorker 内部完成）
+      this.cipher = createConfigCipher(this.configuration);
 
       this.configuration.merge({
         snapshot: this.snapshot,
@@ -219,11 +223,13 @@ export class DataClient extends Base implements BaseClient {
           }
           try {
             // 带容灾读取：成功落快照，服务端异常回退快照
-            const content = await this._getConfigWithCache(evt.dataId, evt.group);
+            const { content, encryptedDataKey } = await this._getConfigWithCache(evt.dataId, evt.group);
+            // 用户边界：变更通知的密文解密后再回调监听器
+            const plainContent = await this.cipher.decryptIfNeeded(evt.dataId, content, encryptedDataKey);
             if (state) {
-              state.content = content;
+              state.content = plainContent;
             }
-            for (const fn of listeners) { fn(content); }
+            for (const fn of listeners) { fn(plainContent); }
           } catch (err) {
             this.throwError(err);
           }
@@ -241,11 +247,13 @@ export class DataClient extends Base implements BaseClient {
       }
       this._startFailoverWatcher();
       // 带容灾拉取当前内容（failover > 服务端 > 快照）：回调监听器并注册 gRPC 监听
-      this._getConfigWithCache(dataId, group).then(async content => {
-        if (content) listener(content);
+      this._getConfigWithCache(dataId, group).then(async ({ content, encryptedDataKey }) => {
+        // 用户边界：初始内容解密后再回调监听器
+        const plainContent = await this.cipher.decryptIfNeeded(dataId, content, encryptedDataKey);
+        if (plainContent) listener(plainContent);
         const state = this._grpcFailoverState!.get(key);
         if (state) {
-          state.content = content;
+          state.content = plainContent;
           // 存在容灾文件则立即进入 failover 模式，否则等下一轮 watcher 探测
           const mtime = await this.snapshot.getFailoverMtime(this._getSnapshotKey(dataId, group));
           if (mtime !== null) {
@@ -312,7 +320,9 @@ export class DataClient extends Base implements BaseClient {
     checkParameters(dataId, group);
     if (this._grpcConfigProxy) {
       // 带本地容灾读取：failover > 服务端 > 快照（对齐 Java SDK 读优先级）
-      return await this._getConfigWithCache(dataId, group, this.configuration.get(ClientOptionKeys.NAMESPACE));
+      const { content, encryptedDataKey } = await this._getConfigWithCache(dataId, group, this.configuration.get(ClientOptionKeys.NAMESPACE));
+      // 用户边界：cipher dataId 解密后返回明文
+      return await this.cipher.decryptIfNeeded(dataId, content, encryptedDataKey);
     }
     const client = this.getClient(options);
     return await client.getConfig(dataId, group);
@@ -341,11 +351,14 @@ export class DataClient extends Base implements BaseClient {
   async publishSingle(dataId, group, content, options?: UnitOptions) {
     checkParameters(dataId, group);
     if (this._grpcConfigProxy) {
+      // 用户边界：cipher dataId 先加密，密文与 encryptedDataKey 经 additionMap 发布
+      const encryptResult = await this.cipher.encryptIfNeeded(dataId, content);
       return await this._grpcConfigProxy.publishSingle(
         dataId, group,
         this.configuration.get(ClientOptionKeys.NAMESPACE),
-        content,
-        options && options.type
+        encryptResult.content,
+        options && options.type,
+        encryptResult.encryptedDataKey
       );
     }
     const client = this.getClient(options);
@@ -364,8 +377,9 @@ export class DataClient extends Base implements BaseClient {
     checkParameters(dataId, group);
     if (this._grpcConfigProxy) {
       const removed = await this._grpcConfigProxy.remove(dataId, group, this.configuration.get(ClientOptionKeys.NAMESPACE));
-      // 同步清理本地快照，避免服务端已删除的配置残留在缓存里（与 HTTP 模式一致）
+      // 同步清理本地快照与 encryptedDataKey 缓存，避免服务端已删除的配置残留在缓存里（与 HTTP 模式一致）
       await this.snapshot.delete(this._getSnapshotKey(dataId, group));
+      await this.snapshot.delete(this._getEncryptedDataKeySnapshotKey(dataId, group));
       return removed;
     }
     const client = this.getClient(options);
@@ -536,16 +550,27 @@ export class DataClient extends Base implements BaseClient {
    * - 否则查询服务端，成功后落快照（空/缺失内容由 Snapshot.save 统一按删除处理，等价 Java saveSnapshot(null)）；
    * - 服务端异常时回退本地快照，快照也没有才抛错。
    */
-  private async _getConfigWithCache(dataId: string, group: string, tenant?: string): Promise<string> {
+  private async _getConfigWithCache(dataId: string, group: string, tenant?: string): Promise<ConfigQueryResult> {
     const key = this._getSnapshotKey(dataId, group);
-    const content = await readConfigWithFailover({
+    const edkKey = this._getEncryptedDataKeySnapshotKey(dataId, group);
+    const result = await readConfigWithFailover({
       snapshotKey: key,
+      encryptedDataKeySnapshotKey: edkKey,
+      isCipher: this.cipher.isCipherDataId(dataId),
       snapshot: this.snapshot,
       fetchFromServer: () => this._grpcConfigProxy!.getConfig(dataId, group, tenant),
       readSnapshotFallback: () => this.snapshot.get(key),
       onServerError: err => this.throwError(err),
     });
-    return content === null ? '' : content;
+    return { content: result.content || '', encryptedDataKey: result.encryptedDataKey };
+  }
+
+  /**
+   * encryptedDataKey 的本地持久化 key，与内容快照（'config/' 前缀）并行的独立命名空间
+   * （'edk/' 前缀），与 ClientWorker.getEncryptedDataKeySnapshotKey 保持一致，HTTP / gRPC 共享。
+   */
+  private _getEncryptedDataKeySnapshotKey(dataId: string, group: string): string {
+    return path.join('edk', this._getSnapshotKey(dataId, group));
   }
 
   /**
@@ -572,10 +597,12 @@ export class DataClient extends Base implements BaseClient {
           state.useFailover = false;
           state.failoverVersion = null;
           try {
-            const content = await this._getConfigWithCache(state.dataId, state.group);
-            if (content !== state.content) {
-              state.content = content;
-              for (const fn of listeners) { fn(content); }
+            const { content, encryptedDataKey } = await this._getConfigWithCache(state.dataId, state.group);
+            // 用户边界：切回服务端内容时解密后再比较/通知
+            const plainContent = await this.cipher.decryptIfNeeded(state.dataId, content, encryptedDataKey);
+            if (plainContent !== state.content) {
+              state.content = plainContent;
+              for (const fn of listeners) { fn(plainContent); }
             }
           } catch (err) {
             this.throwError(err);

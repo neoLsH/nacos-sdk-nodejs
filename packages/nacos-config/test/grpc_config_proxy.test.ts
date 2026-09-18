@@ -48,7 +48,7 @@ describe('test/grpc_config_proxy.test.ts', () => {
 
     await sleep(500);
 
-    const content = await proxy.getConfig(dataId, group);
+    const { content } = await proxy.getConfig(dataId, group);
     assert(content === 'grpc_test=hello', `getConfig should return published content, got: ${content}`);
   });
 
@@ -60,7 +60,7 @@ describe('test/grpc_config_proxy.test.ts', () => {
 
     await sleep(500);
 
-    const content = await proxy.getConfig(dataId, group);
+    const { content } = await proxy.getConfig(dataId, group);
     assert(content === 'grpc_test=updated', `getConfig should return updated content, got: ${content}`);
   });
 
@@ -72,7 +72,7 @@ describe('test/grpc_config_proxy.test.ts', () => {
 
     await sleep(500);
 
-    const content = await proxy.getConfig(dataId, group);
+    const { content } = await proxy.getConfig(dataId, group);
     assert(content === '', `getConfig after remove should return empty, got: ${content}`);
   });
 
@@ -85,7 +85,7 @@ describe('test/grpc_config_proxy.test.ts', () => {
     await sleep(500);
 
     // Get initial MD5
-    const initial = await proxy.getConfig(listenDataId, group);
+    const { content: initial } = await proxy.getConfig(listenDataId, group);
     assert(initial === 'initial=value');
 
     // Listen for changes
